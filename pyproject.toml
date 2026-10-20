@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Исследование API Prom.ua для магазина PLATINUM STORE"
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = ["requests>=2.32,<3", "rich>=13,<15"]
+dependencies = ["requests>=2.32,<3", "rich>=13,<15", "PyYAML>=6,<7"]
 
 [dependency-groups]
 dev = ["pytest>=8,<10", "ruff>=0.9,<1"]
@@ -22,5 +22,6 @@ testpaths = ["tests"]
 [tool.ruff]
 line-length = 100
 exclude = ["scripts/исследование"]
+
 [tool.ruff.lint]
 ignore = ["N999"]
