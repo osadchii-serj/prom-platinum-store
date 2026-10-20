@@ -1,0 +1,28 @@
+# Секреты и локальные настройки
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+dist/
+build/
+
+# IDE и операционная система
+.idea/
+.vscode/
+.DS_Store
+
+# Локальные данные и журналы
+logs/
+data/
+*.sqlite3
+*.db
