@@ -101,6 +101,7 @@ class ЗаписьИмпорта:
     обновлено_utc: str = ""
     статус_http: int | None = None
     код_ошибки: str | None = None
+    sha256_файла: str | None = None
 
     def __post_init__(self) -> None:
         if not self.ключ or "/" in self.ключ or "\\\\" in self.ключ:

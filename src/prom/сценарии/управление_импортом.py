@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import fcntl
+import hashlib
+import os
+import tempfile
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 from typing import Literal
@@ -26,6 +31,46 @@ from prom.api.результаты_импорта import (
     сохранить_запись,
 )
 from prom.интерфейс.стиль import заголовок, сообщение, таблица_параметров
+from prom.сценарии.план_файлового_импорта import проверить_утверждение
+
+
+@contextmanager
+def _блокировка(путь: Path) -> Iterator[None]:
+    """Неблокирующая межпроцессная блокировка по отдельному inode."""
+    if not путь.parent.is_dir():
+        raise FileNotFoundError("Каталог журнала не существует")
+    замок = путь.with_name(путь.name + ".lock")
+    дескриптор = os.open(замок, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        try:
+            fcntl.flock(дескриптор, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as ошибка:
+            raise RuntimeError("Операция импорта уже выполняется") from ошибка
+        yield
+    finally:
+        os.close(дескриптор)
+
+
+def _снимок_файла(файл: Path, ожидаемый_sha256: str) -> Path:
+    """Создать отдельную копию именно проверенных байтов для POST."""
+    if len(ожидаемый_sha256) != 64 or any(с not in "0123456789abcdef" for с in ожидаемый_sha256):
+        raise ValueError("Ожидается SHA-256 из утверждённого предпросмотра")
+    if файл.suffix.lower() != ".xlsx" or not файл.is_file():
+        raise ValueError("Нужен существующий XLSX")
+    данные = файл.read_bytes()
+    if not 0 < len(данные) <= 5_000_000:
+        raise ValueError("Недопустимый размер XLSX")
+    if hashlib.sha256(данные).hexdigest() != ожидаемый_sha256:
+        raise ValueError("XLSX изменился после предпросмотра: POST запрещён")
+    with tempfile.NamedTemporaryFile(
+        mode="wb", prefix=".prom_import_", suffix=".xlsx", delete=False,
+        dir=файл.parent,
+    ) as копия:
+        os.chmod(копия.name, 0o400)
+        копия.write(данные)
+        копия.flush()
+        os.fsync(копия.fileno())
+        return Path(копия.name)
 
 
 def _запустить(
@@ -33,18 +78,21 @@ def _запустить(
     ключ: str,
     источник: Literal["файл", "url"],
     запрос: Callable[[], КвитанцияИмпорта],
+    sha256_файла: str | None = None,
 ) -> ЗаписьИмпорта:
     """Зафиксировать намерение до POST; при сбое запретить повтор."""
     if путь_журнала.exists():
         запись = прочитать_запись(путь_журнала)
         if запись.ключ != ключ or запись.источник != источник:
             raise ValueError("Журнал принадлежит другой операции")
+        if запись.sha256_файла != sha256_файла:
+            raise ValueError("Отпечаток файла не соответствует журналу операции")
         if not можно_повторить_импорт(запись):
             raise RuntimeError("Повтор POST заблокирован: нужна сверка операции")
     else:
         if источник not in ("файл", "url"):
             raise ValueError("Неизвестный источник импорта")
-        запись = ЗаписьИмпорта(ключ, источник, "подготовлено")
+        запись = ЗаписьИмпорта(ключ, источник, "подготовлено", sha256_файла=sha256_файла)
         сохранить_запись(путь_журнала, запись)
 
     запись = replace(запись, состояние="запрос_отправлен")
@@ -86,12 +134,11 @@ def запустить_url(
     """Один запрос URL-импорта; журнал не содержит URL поставщика."""
     if not подтверждено:
         raise PermissionError("Запуск импорта требует явного подтверждения")
-    return _запустить(
-        путь_журнала,
-        ключ,
-        "url",
-        lambda: импортировать_url(адрес, настройки=настройки, подтверждено=True),
-    )
+    with _блокировка(путь_журнала):
+        return _запустить(
+            путь_журнала, ключ, "url",
+            lambda: импортировать_url(адрес, настройки=настройки, подтверждено=True),
+        )
 
 
 def запустить_файл(
@@ -101,16 +148,33 @@ def запустить_файл(
     *,
     подтверждено: bool = False,
     настройки: НастройкиИмпорта | None = None,
+    ожидаемый_sha256: str | None = None,
+    путь_плана: Path | None = None,
 ) -> ЗаписьИмпорта:
-    """Один запрос файлового импорта с локальной фиксацией."""
+    """POST только по неизменяемой копии проверенного XLSX, под блокировкой."""
     if not подтверждено:
         raise PermissionError("Запуск импорта требует явного подтверждения")
-    return _запустить(
-        путь_журнала,
-        ключ,
-        "файл",
-        lambda: импортировать_файл(файл, настройки=настройки, подтверждено=True),
-    )
+    if ожидаемый_sha256 is None:
+        raise PermissionError("Требуется SHA-256 утверждённого предпросмотра")
+    if путь_плана is None:
+        raise PermissionError("Требуется сохранённый утверждённый план")
+    with _блокировка(путь_журнала):
+        проверить_утверждение(путь_плана, файл, ключ, ожидаемый_sha256)
+        if путь_журнала.exists():
+            запись = прочитать_запись(путь_журнала)
+            if not можно_повторить_импорт(запись):
+                raise RuntimeError("Повтор POST заблокирован: нужна сверка операции")
+        копия = _снимок_файла(файл, ожидаемый_sha256)
+        try:
+            return _запустить(
+                путь_журнала, ключ, "файл",
+                lambda: импортировать_файл(
+                    копия, настройки=настройки, подтверждено=True
+                ),
+                sha256_файла=ожидаемый_sha256,
+            )
+        finally:
+            копия.unlink(missing_ok=True)
 
 
 def сверить_статус(путь_журнала: Path) -> tuple[ЗаписьИмпорта, РезультатИмпорта]:
