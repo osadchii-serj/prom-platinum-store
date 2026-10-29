@@ -1,0 +1,1 @@
+запуск предпросмотра наценки - PYTHONPATH=src uv run python предпросмотр_цен_prom.py
